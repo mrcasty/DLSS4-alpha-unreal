@@ -41,6 +41,7 @@ private:
 	friend class FDLSSSceneViewFamilyUpscaler;
 
 	FDLSSStateRef DLSSState;
+	FDLSSStateRef AlphaDLSSState;
 	// in 5.3+ the debug name must match the upscaler's debug name, and since the name includes whether we're running DLSS-RR the history needs to know the denoiser mode
 	ENGXDLSSDenoiserMode DenoiserMode;
 
@@ -64,7 +65,7 @@ private:
 		return FRefCountBase::GetRefCount();
 	}
 
-	FDLSSUpscalerHistory(FDLSSStateRef InDLSSState, ENGXDLSSDenoiserMode InDenoiserMode);
+	FDLSSUpscalerHistory(FDLSSStateRef InDLSSState, FDLSSStateRef InAlphaDLSSState, ENGXDLSSDenoiserMode InDenoiserMode);
 	~FDLSSUpscalerHistory();
 
 };

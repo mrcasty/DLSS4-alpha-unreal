@@ -58,6 +58,8 @@ struct FDLSSPassParameters
 	FRDGTexture* SSSGuide = nullptr;
 	FRDGTexture* DOFGuide = nullptr;
 
+	FRDGTexture* SceneColorOutput = nullptr;
+
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
 	FRDGTexture* EyeAdaptation = nullptr;
 

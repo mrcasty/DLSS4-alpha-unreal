@@ -19,6 +19,7 @@
 #include "GBufferResolvePass.h"
 #include "VelocityCombinePass.h"
 #include "BiasCurrentColorPass.h"
+#include "RenderGraphUtils.h"
 
 #include "DynamicResolutionState.h"
 #include "Engine/GameViewportClient.h"
@@ -41,6 +42,33 @@ static TAutoConsoleVariable<int32> CVarNGXDLSSEnable(
 	TEXT("r.NGX.DLSS.Enable"), 1,
 	TEXT("Enable/Disable DLSS entirely."),
 	ECVF_RenderThreadSafe);
+
+class FDLSSAlphaExtractCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FDLSSAlphaExtractCS);
+	SHADER_USE_PARAMETER_STRUCT(FDLSSAlphaExtractCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
+	END_SHADER_PARAMETER_STRUCT()
+};
+
+IMPLEMENT_GLOBAL_SHADER(FDLSSAlphaExtractCS, "/Plugin/DLSS/Private/DLSSAlphaShaders.usf", "AlphaExtractCS", SF_Compute);
+
+class FDLSSAlphaCombineCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FDLSSAlphaCombineCS);
+	SHADER_USE_PARAMETER_STRUCT(FDLSSAlphaCombineCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputColorTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputAlphaTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputCombinedTexture)
+	END_SHADER_PARAMETER_STRUCT()
+};
+
+IMPLEMENT_GLOBAL_SHADER(FDLSSAlphaCombineCS, "/Plugin/DLSS/Private/DLSSAlphaShaders.usf", "AlphaCombineCS", SF_Compute);
 
 // corresponds to EDLSSPreset
 static TAutoConsoleVariable<int32> CVarNGXDLSSPresetSetting(
@@ -949,14 +977,9 @@ FDLSSOutputs FDLSSSceneViewFamilyUpscaler::AddDLSSPass(
 #endif
 	}
 	FDLSSStateRef DLSSState = (InputDLSSHistory && InputDLSSHistory->DLSSState) ? InputDLSSHistory->DLSSState : MakeShared<FDLSSState, ESPMode::ThreadSafe>();
+	FDLSSStateRef AlphaDLSSState = (InputDLSSHistory && InputDLSSHistory->AlphaDLSSState) ? InputDLSSHistory->AlphaDLSSState : MakeShared<FDLSSState, ESPMode::ThreadSafe>();
 
-	{
-		FDLSSShaderParameters* PassParameters = GraphBuilder.AllocParameters<FDLSSShaderParameters>();
-
-		// Set up common shader parameters
-		const FIntPoint InputExtent = Inputs.SceneColorInput->Desc.Extent;
-		
-		const FIntRect OutputViewRect = Inputs.OutputViewRect;
+	
 
 		// in some configurations we can end up with an InputViewRect that is larger (by a few pixels) than the actual texture dimensions
 		// r.Test.ViewRectOffset = 3 can get into this state
@@ -978,6 +1001,18 @@ FDLSSOutputs FDLSSSceneViewFamilyUpscaler::AddDLSSPass(
 				*AdjustedInputViewRect.ToString(), AdjustedInputViewRect.Width(), AdjustedInputViewRect.Height()
 			);
 		}
+
+		// Alpha Upscaling Decision Logic
+		// if r.PostProcessing.PropagateAlpha is not enabled no reason incur a 20% perf cost upscaling alpha channel.
+		static auto PropagateAlphaCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PostProcessing.PropagateAlpha"));
+		const bool bEnableAlphaUpscaling = CVarNGXEnableAlphaUpscaling.GetValueOnRenderThread() >= 0 ? (CVarNGXEnableAlphaUpscaling.GetValueOnRenderThread() > 0) : PropagateAlphaCVar && (PropagateAlphaCVar->GetBool());
+
+		FRDGTextureRef ColorOutputTexture = Outputs.SceneColor;
+		FRDGTextureRef AlphaOutputTexture = nullptr;
+
+		auto ExecuteDLSSPassLambda = [&](FDLSSPassParameters& Inputs, FDLSSStateRef InState, const TCHAR* InPassName)
+		{
+		FDLSSShaderParameters* PassParameters = GraphBuilder.AllocParameters<FDLSSShaderParameters>();
 
 		// Input buffer shader parameters
 		{
@@ -1014,7 +1049,7 @@ FDLSSOutputs FDLSSSceneViewFamilyUpscaler::AddDLSSPass(
 
 		// Outputs 
 		{
-			PassParameters->SceneColorOutput = Outputs.SceneColor;
+			PassParameters->SceneColorOutput = Inputs.SceneColorOutput; // UAV
 		}
 
 
@@ -1031,10 +1066,6 @@ FDLSSOutputs FDLSSSceneViewFamilyUpscaler::AddDLSSPass(
 		const bool bUseBiasCurrentColorMask = CVarNGXDLSSBiasCurrentColorMask.GetValueOnRenderThread() != 0;
 		const bool bReleaseMemoryOnDelete = CVarNGXDLSSReleaseMemoryOnDelete.GetValueOnRenderThread() != 0;
 
-		//if r.PostProcessing.PropagateAlpha is not enabled no reason incur a 20% perf cost upscaling alpha channel.
-		static auto PropagateAlphaCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PostProcessing.PropagateAlpha"));
-		
-		const bool bEnableAlphaUpscaling = CVarNGXEnableAlphaUpscaling.GetValueOnRenderThread() >= 0 ? (CVarNGXEnableAlphaUpscaling.GetValueOnRenderThread() > 0) : PropagateAlphaCVar && (PropagateAlphaCVar->GetBool());
 
 		NGXRHI* LocalNGXRHIExtensions = Upscaler->NGXRHIExtensions;
 		const int32 NGXDLSSPreset = GetNGXDLSSPresetFromQualityMode(DLSSQualityMode);
@@ -1052,15 +1083,15 @@ FDLSSOutputs FDLSSSceneViewFamilyUpscaler::AddDLSSPass(
 			}
 		};
 		GraphBuilder.AddPass(
-			RDG_EVENT_NAME("DLSS %s%s %dx%d -> %dx%d",
-				PassName,
+			RDG_EVENT_NAME("DLSS %s %s %dx%d -> %dx%d",
+				InPassName,
 				NGXDenoiserModeString(Inputs.DenoiserMode),
 				AdjustedInputViewRect.Width(), AdjustedInputViewRect.Height(),
 				DestRect.Width(), DestRect.Height()),
 			PassParameters,
 			ERDGPassFlags::Compute | ERDGPassFlags::Raster | ERDGPassFlags::Copy |  ERDGPassFlags::SkipRenderPass,
 			// FRHICommandListImmediate forces it to run on render thread, FRHICommandList doesn't
-			[LocalNGXRHIExtensions, PassParameters, Inputs, AdjustedInputViewRect, bCameraCut, DeltaWorldTimeMS, NGXDLSSPreset, NGXDLSSRRPreset, NGXPerfQuality, DLSSState, bUseAutoExposure, bEnableAlphaUpscaling, bReleaseMemoryOnDelete, bUseBiasCurrentColorMask](FRHICommandListImmediate& RHICmdList)
+			[LocalNGXRHIExtensions, PassParameters, Inputs, AdjustedInputViewRect, bCameraCut, DeltaWorldTimeMS, NGXDLSSPreset, NGXDLSSRRPreset, NGXPerfQuality, InState, bUseAutoExposure, bReleaseMemoryOnDelete, bUseBiasCurrentColorMask](FRHICommandListImmediate& RHICmdList)
 			{
 				FRHIDLSSArguments DLSSArguments;
 				FMemory::Memzero(&DLSSArguments, sizeof(DLSSArguments));
@@ -1114,7 +1145,8 @@ FDLSSOutputs FDLSSSceneViewFamilyUpscaler::AddDLSSPass(
 				DLSSArguments.PreExposure = Inputs.PreExposure;
 				DLSSArguments.bUseAutoExposure = bUseAutoExposure;
 
-				DLSSArguments.bEnableAlphaUpscaling = bEnableAlphaUpscaling;
+				// FORCE ALPHA OFF - We handle it manually
+				DLSSArguments.bEnableAlphaUpscaling = false;
 
 				DLSSArguments.DenoiserMode = Inputs.DenoiserMode;
 
@@ -1179,21 +1211,89 @@ FDLSSOutputs FDLSSSceneViewFamilyUpscaler::AddDLSSPass(
 #endif
 
 			RHICmdList.EnqueueLambda(
-				[LocalNGXRHIExtensions, DLSSArguments, DLSSState](FRHICommandListImmediate& Cmd) mutable
+			[LocalNGXRHIExtensions, DLSSArguments, InState](FRHICommandListImmediate& Cmd) mutable
 			{
 				const uint32 FeatureCreationNode = CVarNGXDLSSFeatureCreationNode.GetValueOnRenderThread();
 				const uint32 FeatureVisibilityMask = CVarNGXDLSSFeatureVisibilityMask.GetValueOnRenderThread();
 
 				DLSSArguments.GPUNode = FeatureCreationNode == -1 ? Cmd.GetGPUMask().ToIndex() : FMath::Clamp(FeatureCreationNode, 0u, GNumExplicitGPUsForRendering - 1);
 				DLSSArguments.GPUVisibility = FeatureVisibilityMask == -1 ? Cmd.GetGPUMask().GetNative() : (Cmd.GetGPUMask().All().GetNative() & FeatureVisibilityMask) ;
-				LocalNGXRHIExtensions->ExecuteDLSS(Cmd, DLSSArguments, DLSSState);
+				LocalNGXRHIExtensions->ExecuteDLSS(Cmd, DLSSArguments, InState);
 			});
 		});
+	};
+
+
+	if (bEnableAlphaUpscaling)
+	{
+		// Intermediate Color Output (so we don't mess up final output before combine)
+		FRDGTextureDesc SceneColorDesc = Outputs.SceneColor->Desc; // Reuse desc
+		ColorOutputTexture = GraphBuilder.CreateTexture(SceneColorDesc, TEXT("DLSSColorOutput"));
+		AlphaOutputTexture = GraphBuilder.CreateTexture(SceneColorDesc, TEXT("DLSSAlphaOutput"));
+
+		FRDGTextureDesc AlphaInputDesc = Inputs.SceneColorInput->Desc;
+		AlphaInputDesc.Flags |= TexCreate_UAV;
+		FRDGTextureRef AlphaInputTexture = GraphBuilder.CreateTexture(AlphaInputDesc, TEXT("DLSSAlphaInput"));
+
+		// 1. Extract Alpha Pass
+		{
+			FDLSSAlphaExtractCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDLSSAlphaExtractCS::FParameters>();
+			PassParameters->InputTexture = Inputs.SceneColorInput;
+			PassParameters->OutputTexture = GraphBuilder.CreateUAV(AlphaInputTexture);
+
+			TShaderMapRef<FDLSSAlphaExtractCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
+				RDG_EVENT_NAME("DLSS Alpha Extract"),
+				ComputeShader,
+				PassParameters,
+				FComputeShaderUtils::GetGroupCount(AlphaInputTexture->Desc.Extent, FIntPoint(8, 8))
+			);
+		}
+
+		// 2. Execute DLSS on Alpha
+		{
+			// Need a copy of parameters but pointing to Alpha Input/Output
+			FDLSSPassParameters AlphaPassParams = Inputs;
+			AlphaPassParams.SceneColorInput = AlphaInputTexture;
+			AlphaPassParams.SceneColorOutput = AlphaOutputTexture;
+			AlphaPassParams.DenoiserMode = ENGXDLSSDenoiserMode::Off;
+
+			ExecuteDLSSPassLambda(AlphaPassParams, AlphaDLSSState, TEXT("AlphaPass"));
+		}
 	}
+
+	// 3. Main DLSS Pass (Color)
+	{
+		// Used to be inline, now using lambda to share logic with Alpha pass.
+		// NOTE: Main pass requires full features (Denoiser etc) which are handled in the lambda.
+		FDLSSPassParameters MainPassParams = Inputs;
+		MainPassParams.SceneColorOutput = ColorOutputTexture; // Redirect to intermediate if alpha on
+		ExecuteDLSSPassLambda(MainPassParams, DLSSState, PassName);
+	}
+
+	// 4. Combine Pass
+	if (bEnableAlphaUpscaling)
+	{
+		FDLSSAlphaCombineCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDLSSAlphaCombineCS::FParameters>();
+		PassParameters->InputColorTexture = ColorOutputTexture;
+		PassParameters->InputAlphaTexture = AlphaOutputTexture;
+		PassParameters->OutputCombinedTexture = GraphBuilder.CreateUAV(Outputs.SceneColor);
+
+		TShaderMapRef<FDLSSAlphaCombineCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("DLSS Alpha Combine"),
+			ComputeShader,
+			PassParameters,
+			FComputeShaderUtils::GetGroupCount(OutputExtent, FIntPoint(8, 8))
+		);
+	}
+
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
 	check(OutputCustomHistoryInterface);
-	(*OutputCustomHistoryInterface) = new FDLSSUpscalerHistory(DLSSState, Inputs.DenoiserMode);
+	(*OutputCustomHistoryInterface) = new FDLSSUpscalerHistory(DLSSState, AlphaDLSSState, Inputs.DenoiserMode);
 #else
 	if (!View.bStatePrevViewInfoIsReadOnly && OutputHistory)
 	{
@@ -1210,7 +1310,7 @@ FDLSSOutputs FDLSSSceneViewFamilyUpscaler::AddDLSSPass(
 	{
 		if (!OutputCustomHistoryInterface->GetReference())
 		{
-			(*OutputCustomHistoryInterface) = new FDLSSUpscalerHistory(DLSSState, Inputs.DenoiserMode);
+			(*OutputCustomHistoryInterface) = new FDLSSUpscalerHistory(DLSSState, AlphaDLSSState, Inputs.DenoiserMode);
 		}
 	}
 #endif

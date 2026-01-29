@@ -22,8 +22,8 @@
 #define LOCTEXT_NAMESPACE "FDLSSModule"
 
 
-FDLSSUpscalerHistory::FDLSSUpscalerHistory(FDLSSStateRef InDLSSState, ENGXDLSSDenoiserMode InDenoiserMode)
-	: DLSSState(InDLSSState), DenoiserMode(InDenoiserMode)
+FDLSSUpscalerHistory::FDLSSUpscalerHistory(FDLSSStateRef InDLSSState, FDLSSStateRef InAlphaDLSSState, ENGXDLSSDenoiserMode InDenoiserMode)
+	: DLSSState(InDLSSState), AlphaDLSSState(InAlphaDLSSState), DenoiserMode(InDenoiserMode)
 {
 }
 
