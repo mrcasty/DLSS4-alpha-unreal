@@ -1,0 +1,26 @@
+#include "/Engine/Public/Platform.ush"
+
+Texture2D InputTexture;
+RWTexture2D<float4> OutputTexture;
+
+[numthreads(8, 8, 1)]
+void AlphaExtractCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    float Alpha = InputTexture[ThreadId.xy].a;
+    // Write Alpha to RGB, Alpha 1.0
+    OutputTexture[ThreadId.xy] = float4(Alpha, Alpha, Alpha, 1.0f);
+}
+
+Texture2D InputColorTexture;
+Texture2D InputAlphaTexture;
+RWTexture2D<float4> OutputCombinedTexture;
+
+[numthreads(8, 8, 1)]
+void AlphaCombineCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    float3 Color = InputColorTexture[ThreadId.xy].rgb;
+    // We upscale the alpha as "Color", so we just take the Red channel (or G or B) as our new Alpha
+    float Alpha = InputAlphaTexture[ThreadId.xy].r;
+    
+    OutputCombinedTexture[ThreadId.xy] = float4(Color, Alpha);
+}
