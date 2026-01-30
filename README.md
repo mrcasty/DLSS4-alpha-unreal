@@ -18,21 +18,20 @@ This repository contains a modified version of the NVIDIA DLSS Plugin for Unreal
 
 ## Contents
 
-*   **`5.6/DLSSA/Plugins/DLSS/`**: The modified C++ plugin source code.
+*   **`5.6/DLSSA/Plugins/`**: `DLSS` and `StreamlineNGXCommon` plugins.
 *   **`5.6/DLSSA/`**: Sample project with a test map demonstrating the fix.
-*   **Future Versions**: A `5.7/` folder supports upcoming engine updates.
+*   **TODO**: A `5.7/DLSAA`: comming soon
 
 ## Prerequisites
 
 1.  **Unreal Engine 5.6+**: Required for module compatibility.
 2.  **NVIDIA DLSS 4 Plugin**: This repository contains only the source modifications. The official NVIDIA DLSS Plugin must be installed in the Engine to provide the necessary binaries (`nvngx_dlss.dll`) and libraries. You only need the `DLSS` and `StreamlineNGXCommon` modules at the project level to build this modification.
+3.  **Visual Studio 2022**: To compile the plugins
 
 ## Installation
 
-1.  Copy the `Plugins/DLSS` folder from this repository into your project's `Plugins` directory.
-2.  Add the `DLSS` plugin to your `.uproject` file.
-3.  Re-generate Visual Studio project files.
-4.  Recompile the plugin.
+1.  Generate project files and compile the project included in this repo
+3.  Copy the `DLSS` and `StramlineNGXCommon` folders to your project's plugins folder
 
 ## Usage
 
